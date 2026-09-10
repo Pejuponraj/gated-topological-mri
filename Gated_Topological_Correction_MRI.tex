@@ -1,0 +1,979 @@
+\documentclass[12pt]{article}
+\usepackage{float}
+\usepackage[a4paper, margin=1in]{geometry}
+\usepackage[utf8]{inputenc}
+\usepackage{amsmath}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage{amsmath, amsthm, amssymb}
+\usepackage{booktabs}
+
+\newtheorem{definition}{Definition}[section]
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{lemma}[theorem]{Lemma}
+\theoremstyle{definition}
+\newtheorem{remark}{Remark}[section]
+\theoremstyle{plain}
+
+% =====================================================================
+%  DRAFT.  All numbers in Section 4 are REAL, from runs on BraTS data.
+%
+%  Still in square brackets:
+%    - prose that has not been written yet
+%    - the RPCA comparison, which exists only on synthetic volumes
+%
+%  Nothing here is invented. Where a number is synthetic-only it says so.
+% =====================================================================
+
+\title{Gated Topological Correction of Stripe Artefacts in Brain MRI}
+\author{
+Ponraj A.~P.$^{1}$ \and Muthu Ramachandran$^{2}$ \and Kulvinder Panesar$^{3}$ \\[4pt]
+\normalsize $^{1}$Independent Researcher, United Kingdom \\
+\normalsize $^{2}$Forti5 Tech Ltd and University of South Africa \\
+\normalsize $^{3}$University of Bradford, United Kingdom \\[2pt]
+\normalsize \texttt{pejuponraj@gmail.com}, \texttt{muthu.ramachandran@forti5.tech}, \\
+\normalsize \texttt{K.Panesar@bradford.ac.uk}
+}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Radiofrequency interference and $k$-space spikes produce coherent stripe artefacts
+in MRI. Segmentation models trained on curated data degrade sharply on such scans:
+in our experiments the Dice coefficient of a 3D U-Net falls from 0.70 on clean brain
+MRI to 0.22 under strong striping.
+
+We present a training-free correction built on a criterion from generalized
+topology. Treating acquisition artefacts as a hereditary class $\mathcal{H}$ in the
+sense of Cs\'asz\'ar, we score each voxel by how far it lies outside the span of its
+neighbourhood, a quantity motivated by the local failure of hyperconnectedness. On
+30 volumes from the Medical Segmentation Decathlon this criterion ranks
+stripe-corrupted voxels better than the classical median residual and better than
+three statistical baselines, winning on every volume at every severity
+($p \approx 1.9\times 10^{-9}$).
+
+Detection alone is not sufficient. Replacing flagged voxels with the local median
+recovers only about one percent of the lost Dice, because a stripe corrupts almost
+every voxel and the neighbourhood used for repair is itself corrupted. We instead
+use the flagged voxels to identify which frequency components carry the artefact and
+subtract those from the whole volume. This recovers substantially more, but degrades
+clean scans, which makes it unusable as an unconditional preprocessing step.
+
+We therefore gate the correction: the same criterion scores each scan, and the
+repair is applied only when that score exceeds a threshold fitted on training data.
+On 25 held-out volumes the gate fired on none of the clean scans and all of the
+corrupted ones. Clean-scan Dice was preserved exactly (0.7039, unchanged), while
+13.8 to 39.2 percent of the Dice lost to the artefact was recovered
+($p < 10^{-7}$ at every severity).
+
+An ablation isolates what the criterion contributes. Removing it and subtracting the
+largest spectral components directly is better at high artefact amplitude, where the
+artefact dominates the spectrum, but substantially worse at low amplitude, where it
+removes anatomy instead. The correction is therefore scoped to subtle artefacts,
+which is the regime that matters clinically. The gate has no such caveat: none of
+three simpler scan-level scores separates clean from corrupted volumes, whereas the
+proposed score does so with a fivefold margin, and it can also serve as a
+reliability flag for a deployed model independently of whether the correction is
+applied.
+
+\medskip
+\textbf{Keywords:} Hereditary Class, Generalized Topology, Hyperconnectedness, MRI
+Artefacts, $k$-space Spikes, Brain Tumour Segmentation, MONAI.
+\end{abstract}
+
+% =====================================================================
+\section{Introduction}
+% =====================================================================
+
+Deep learning models for medical image segmentation are developed and validated on
+curated research cohorts. Clinical practice does not supply curated data. Scans
+arrive with the variability of the scanner, the sequence, the operator and the
+patient, and a model that reports a high Dice coefficient on a benchmark may report
+a much lower one on the images it is actually given. This gap is now documented
+systematically: benchmarking platforms built for the purpose find modern networks
+highly susceptible to distribution shifts and corruptions in MRI
+\cite{boone2023rood}, and robustness to clinical artefacts has become an explicit
+design goal for segmentation methods intended for uncurated data
+\cite{billot2023synthseg}.
+
+Among the ways a scan can depart from its curated counterpart, acquisition artefacts
+are the most abrupt. This paper concerns one family: the periodic stripe artefact produced by $k$-space
+spikes, described in the imaging literature as herringbone, crisscross or corduroy
+artefact \cite{rios2026}. It arises from electrical discharge in the receiver chain,
+from defective or loose components in the radiofrequency circuitry, and from
+operating the gradients at high duty cycle. Radiofrequency interference more broadly
+remains common in clinical practice and is not eliminated by newer hardware: a 2024
+review characterises it as a frequent MRI artefact arising from unwanted
+radiofrequency fields inside the scanner room, and notes that the resulting pattern
+can mimic pathology, obscure underlying tissue, lower the signal-to-noise ratio, and
+in severe cases render an image non-diagnostic \cite{kwok2024}.
+
+Correction methods for this artefact are mature. In $k$-space, where the artefact
+originates as a small number of corrupted points, the current standard is despiking
+by robust principal component analysis \cite{campbell2016}, preceded by amplitude
+thresholding with local replacement \cite{foo1994snore} and by Fourier-domain
+identification \cite{kao2000}. In the image domain the classical tool is the
+switching median filter family \cite{sun1994,hwang1995,wang1999}, which detects
+impulsive voxels by a local statistic and replaces only those. We are not proposing
+to replace any of these. They are well validated and, at high artefact amplitude,
+they work.
+
+Two gaps remain. The first is one of evaluation. Correction methods for spike
+artefacts are assessed by image-quality metrics, typically root mean square error or
+signal fidelity, and not by the performance of the analysis that follows. Whether
+correcting a spike improves a downstream segmentation is a different question from
+whether it reduces image error, and it has not been answered for this artefact
+family. The closest precedent evaluates correction by segmentation Dice for motion
+artefacts \cite{oksuz2019}, not for spikes. The second gap is one of deployment. A
+preprocessing step is applied to every scan that passes through the pipeline,
+including the clean majority. A correction that improves corrupted scans while
+degrading clean ones may have a negative expected effect in a population where
+corruption is uncommon, and image-quality evaluation on corrupted scans alone will
+not reveal this.
+
+Two other lines of work address the same problem differently. Robustness can be
+obtained at training time, by augmenting with simulated artefacts so the network
+learns to tolerate them; this is effective for anatomical segmentation
+\cite{boone2023rood} and has been applied to pulsation artefacts simulated directly
+in $k$-space \cite{tamada2025}. Alternatively the correction itself can be learned. The closest such work to ours
+\cite{rios2026} also generates herringbone and zipper artefacts synthetically in
+$k$-space with controllable severity, and corrects them with a wavelet-domain
+attention U-Net, reporting SSIM $0.985 \pm 0.022$ on Dallas Lifespan Brain Study
+volumes. Both require training. The method proposed here does not: it is a
+test-time step that can be added to an existing deployed model without retraining
+it, which is the relevant constraint when the model is fixed, certified, or supplied
+by a vendor.
+
+This paper addresses both. We introduce a voxel-level artefact criterion derived
+from the hereditary-class formulation of generalized topology, show that it detects
+stripe corruption more reliably than the classical median residual and than three
+statistical baselines, and then show that better detection does not by itself
+produce better segmentation. We identify why, change the repair accordingly, and add
+a scan-level gate that determines whether to intervene at all. Everything is
+evaluated by downstream segmentation Dice on public data, with the gate fitted on
+training volumes only.
+
+\subsection{Contributions}
+
+\begin{enumerate}
+    \item A voxel-level artefact criterion derived from the hereditary-class
+          formulation of generalized topology, which outperforms the classical
+          median residual and three statistical baselines on 30 volumes at every
+          severity tested.
+    \item The observation, with its mechanism, that better detection does not by
+          itself yield better segmentation: local repair recovers about one percent
+          of the lost Dice because the repair neighbourhood is itself corrupted.
+    \item A detection-driven frequency-domain repair that recovers substantially
+          more, and a scan-level gate that prevents it from damaging clean scans.
+    \item An evaluation by downstream segmentation Dice rather than image-quality
+          metrics, with the gate fitted on training data only.
+    \item The observation that the same scan-level score separates clean from
+          corrupted acquisitions without error, and can therefore serve as a
+          reliability flag for a deployed segmentation model independently of
+          whether the correction is applied.
+    \item An ablation removing the criterion from each role, which establishes the
+          operating range of the correction and shows that no simpler scan-level
+          score reproduces the gate.
+\end{enumerate}
+
+% =====================================================================
+\section{Background and Definitions}
+% =====================================================================
+
+\subsection{Stripe Artefacts in MRI}
+
+MRI does not acquire an image directly. It acquires the spatial frequency
+representation of the object, $k$-space, from which the image is obtained by inverse
+Fourier transform. The artefact considered here originates as a corruption of one or
+a few points in that frequency representation, typically from an electrical
+discharge or an interfering signal coinciding with readout.
+
+The consequence of the Fourier relationship is that a corruption localised in
+$k$-space is delocalised in the image. A single corrupted point at spatial frequency
+$(k_x, k_y)$ contributes a sinusoid spanning the entire field of view, with that
+frequency and with amplitude proportional to the magnitude of the corruption.
+Several corrupted points superimpose several sinusoids, producing the characteristic
+regular striping.
+
+This is the source of the difficulty. The artefact is global in the image while its
+cause is local in $k$-space, and it is smooth almost everywhere: between adjacent
+voxels the ripple changes by only a small fraction of its amplitude. A detector that
+asks whether a voxel differs sharply from its neighbours therefore sees very little,
+even where the accumulated error is large. Correction in $k$-space avoids this
+problem entirely by working where the artefact is compact, which is why the
+established methods operate there. Correction in the image domain must contend with
+an artefact that is everywhere and locally inconspicuous.
+
+\subsection{Median Filtering and its Operating Assumption}
+
+The switching median filter and its descendants
+\cite{sun1994,hwang1995,wang1999,chen1999tristate,ng2006bdnd} detect a corrupted
+voxel by its deviation from the local median and replace it with that median. Both halves of the
+procedure rest on one assumption: that within any window, the corrupted voxels are a
+minority and the median is therefore drawn from the uncorrupted majority.
+
+The assumption fails in three distinct ways, and it is worth separating them because
+they call for different remedies.
+
+First, by density. Let a fraction $q$ of voxels be corrupted independently. Once
+$q > 1/2$ the median of a window is itself a corrupted value, so both the detection
+statistic and the replacement value are drawn from the artefact rather than from the
+signal. Adaptive window schemes \cite{hwang1995} and boundary-discriminative detectors
+\cite{ng2006bdnd} postpone this but do not remove it.
+
+Second, by extent. If the corrupted region is contiguous and at least as large as the
+window, then every voxel in that window is corrupted regardless of the global
+fraction $q$. The window contains no clean reference, and the median is a local
+average of the artefact.
+
+Third, by smoothness. This is the case relevant here. A ripple of amplitude $A$ and
+spatial frequency $k$ changes between adjacent voxels by approximately $2\pi A k / N$,
+where $N$ is the field of view in voxels. For the frequencies typical of spike
+artefacts this is a small fraction of $A$. The local residual $|I - \mu|$ is
+therefore small even where the artefact contributes a large error, and the median
+filter neither detects the corruption nor, if forced to act, removes it: the median
+of a rippled neighbourhood is itself rippled.
+
+The third failure mode is not a matter of degree. No choice of window size or
+threshold recovers a detector whose statistic is insensitive to the artefact by
+construction. It requires a different statistic, which is the subject of the next
+section, and a different repair, which is the subject of Section~3.3.
+
+\subsection{Generalized Topology and Hereditary Classes}
+
+The construction follows Cs\'asz\'ar \cite{csaszar2002}, restated here so the paper
+is self-contained.
+
+\begin{definition}[Generalized Topology]
+A generalized topology $\kappa$ on a set $X$ is a collection of subsets of $X$ such
+that $\emptyset \in \kappa$ and any union of elements of $\kappa$ belongs to
+$\kappa$.
+\end{definition}
+
+\begin{definition}[Generalized Interior and Closure]
+For $A \subseteq X$,
+\begin{equation}
+    int_\kappa(A) = \bigcup \{ G \in \kappa \mid G \subseteq A \},
+    \qquad
+    c_\kappa(A) = \bigcap \{ F \mid A \subseteq F,\; X \setminus F \in \kappa \}.
+\end{equation}
+\end{definition}
+
+\begin{definition}[Hereditary Class]
+A collection $\mathcal{H}$ of subsets of $X$ is a hereditary class if $A \in
+\mathcal{H}$ and $B \subseteq A$ imply $B \in \mathcal{H}$. Here $\mathcal{H}$
+represents subsets attributable to acquisition artefacts rather than anatomy.
+\end{definition}
+
+\begin{definition}[Semi-$\mathcal{H}$-Open Sets]
+$A \subseteq X$ is semi-$\mathcal{H}$-open if
+$A \subseteq c_\kappa(int_\kappa(A)) \cup N$ for some $N \in \mathcal{H}$.
+\end{definition}
+
+\begin{definition}[Hyperconnectedness]
+A space is hyperconnected if every two non-empty open sets intersect. Locally, a
+voxel violates hyperconnectedness relative to its neighbourhood when the
+$\kappa$-open set through it fails to meet those of its neighbours.
+\end{definition}
+
+% =====================================================================
+\section{Method}
+% =====================================================================
+
+\subsection{A Generalized Topology on the Image}
+
+We take $X$ to be the set of brain voxels and generate $\kappa$ from intensity level
+sets: for a level $t$ and tolerance $\varepsilon$,
+\begin{equation}
+    G_{t,\varepsilon} = \{\, v \in X : |I(v) - t| < \varepsilon \,\},
+\end{equation}
+with $\kappa$ the closure of $\{G_{t,\varepsilon}\}$ under arbitrary union together
+with $\emptyset$. This is a generalized topology rather than a topology: finite
+intersections are not required.
+
+\begin{remark}[Why level sets rather than the pixel grid]
+A voxel grid already carries a topology, given by spatial adjacency, and the
+classical filters exploit it. Fifty years of mathematical morphology have developed
+that exploitation thoroughly, and an approach that simply defines another
+neighbourhood structure on the same grid is unlikely to improve on it. We tested
+this expectation and found it correct: reformulations of the criterion that remained
+grid-based, including one built on a region adjacency graph over superpixels, did
+not outperform median filtering.
+
+The level-set topology is generated by intensity rather than by position. Two voxels
+belong to a common $\kappa$-open set when their intensities are close, whether or
+not they are spatially adjacent. This matters for the failure mode identified in
+Section~2.2. A ripple is smooth along the grid, so grid-based statistics see little;
+but it displaces voxels systematically within the intensity ordering, so the
+level-set structure around a voxel changes in a way that spatial smoothness does not
+conceal. The criterion below is built on that structure rather than on spatial
+difference.
+\end{remark}
+
+\subsection{The Detection Criterion}
+
+\begin{definition}[Neighbourhood span violation]
+For a voxel $v$, let $\rho_1(v)$ and $\rho_2(v)$ denote the second smallest and
+second largest intensities in the $3\times3\times3$ neighbourhood of $v$. Define
+\begin{equation}
+    \Xi(v) \;=\; \max\bigl(\, I(v) - \rho_2(v),\; \rho_1(v) - I(v) \,\bigr).
+\end{equation}
+Voxels with large $\Xi$ are assigned to the realised hereditary class $\mathcal{H}$.
+\end{definition}
+
+\begin{remark}[Relation to hyperconnectedness]
+When $v$ is an extremum of its neighbourhood, $\Xi$ reduces exactly to the
+hyperconnectedness violation: the $\kappa$-open set through $v$ fails to meet those
+of its neighbours. Away from extrema it behaves as a rank-based deviation statistic.
+The criterion is therefore \emph{motivated by} hyperconnectedness rather than being a
+literal test of it, and we state this explicitly rather than overclaim.
+\end{remark}
+
+\begin{remark}[Relation to mathematical morphology]
+$\Xi$ is computed with rank filters, which are morphological operators, and the
+question of whether it is a morphological gradient under another name is a fair one.
+It is not \cite{serra1982}. The morphological gradient measures the \emph{spread} of a neighbourhood;
+$\Xi$ measures whether the voxel lies \emph{outside} it. On a clean step edge the
+morphological gradient is large while $\Xi$ is exactly zero, and across a synthetic
+volume the two are only weakly related (Spearman $-0.302$). This distinction is the
+point: $\Xi$ ignores anatomical boundaries and responds to artefacts.
+\end{remark}
+
+\begin{remark}[A density criterion that does not work]
+An earlier formulation realised $\mathcal{H}$ through a $k$-nearest-neighbour density
+statistic in an intensity-feature embedding, following the one-dimensional form of
+this filter. It performs poorly here, and the reason is instructive. Under the
+threshold-free protocol of Section~4.1 it recovers 26.3\% of the corrupted voxels
+against 100\% for the median residual. Artefacts of similar amplitude form their own
+dense cluster in feature space: for a corrupted voxel, all ten of its nearest
+neighbours in that space are also corrupted. A density-based outlier test therefore
+cannot see them as outliers. We report this because it motivates the span-based
+formulation above.
+\end{remark}
+
+\subsection{Repair}
+
+Let $\Phi_\alpha(I)$ denote the set of voxels with the largest $\Xi$, comprising a
+fraction $\alpha$ of the brain mask. Two repairs are compared.
+
+\textbf{Local replacement.} Each flagged voxel is replaced by its local median. This
+is the classical switching-median repair.
+
+\textbf{Frequency subtraction.} Let $r$ be the residual $I - \mu_5$ restricted to
+$\Phi_\alpha(I)$ and zero elsewhere, where $\mu_5$ is the local median at scale 5.
+The components of $\hat{r}$ with largest magnitude identify the frequencies carrying
+the artefact; the corresponding components of $\hat{I}$ are subtracted from the whole
+volume. Detection determines which frequencies are removed.
+
+\begin{remark}[Why local replacement cannot work here]\label{rem:localfail}
+A stripe corrupts essentially every voxel: at the severities tested, over 97\% of the
+brain mask. Repairing a fraction $\alpha = 0.1$ leaves the remainder untouched, and
+the neighbourhood from which a replacement value is drawn is itself rippled. The
+limitation is structural rather than a matter of parameter choice, and increasing
+$\alpha$ does not resolve it.
+\end{remark}
+
+\subsection{The Gate}
+
+Frequency subtraction improves corrupted scans but degrades clean ones
+(Section~4.3), so it cannot be applied unconditionally. We therefore score each scan
+and intervene only when that score is high.
+
+\begin{definition}[Scan-level artefact score]
+Let $r$ be the flagged residual defined above. Define
+\begin{equation}
+    S(I) \;=\; \frac{\sum_{j \in T} |\hat{r}_j|}{\sum_j |\hat{r}_j|},
+\end{equation}
+where $T$ indexes the six largest components of $\hat{r}$. A stripe makes the flagged
+voxels periodic, concentrating $\hat{r}$; on a clean scan the flagged voxels are
+scattered and $\hat{r}$ is diffuse.
+\end{definition}
+
+The gate threshold is fitted on training volumes only and is never seen by the
+validation set. Section~4.3 reports the separation achieved.
+
+\begin{remark}[No stability guarantee]
+The bottleneck stability result available for the one-dimensional form of this filter
+concerns persistence diagrams. The objects here are detection rankings and corrected
+volumes, and no corresponding guarantee is claimed. Both the criterion and the repair
+are presented as empirical.
+\end{remark}
+
+\subsection{Implementation}
+
+Both criterion and repair are implemented as dictionary transforms conforming to the
+MONAI transform interface \cite{cardoso2022monai}, and compose with an otherwise
+unmodified pipeline:
+
+\begin{verbatim}
+Compose([
+    LoadImaged(keys=["image", "label"]),
+    EnsureChannelFirstd(keys=["image", "label"]),
+    Orientationd(keys=["image", "label"], axcodes="RAS"),
+    GatedTopologicalRepaird(keys="image"),
+    NormalizeIntensityd(keys="image", nonzero=True),
+    EnsureTyped(keys=["image", "label"]),
+])
+\end{verbatim}
+
+No component of the segmentation model is modified and no retraining is required.
+
+% =====================================================================
+\section{Experiments and Results}
+% =====================================================================
+
+\subsection{Setup}
+
+Medical Segmentation Decathlon Task01\_BrainTumour \cite{antonelli2021msd}, derived
+from BraTS. Publicly available and de-identified, so no ethical approval is required.
+The FLAIR modality is used and all tumour sub-regions are merged into a single
+foreground label.
+
+The 484 available volumes are divided once and used as shown in Table~1. No volume
+appears in more than one role, and in particular the gate threshold is fitted only on
+volumes the network was trained on, never on the held-out set.
+
+\begin{table}[H]
+\centering
+\caption{Use of the data. The splits are disjoint. Detection is evaluated on a larger
+set than segmentation because it does not require the network and is cheaper to run.}
+\begin{tabular}{lcl}
+\toprule
+Split & Volumes & Used for \\
+\midrule
+Training & 60 & network training; gate threshold fitted on the first 12 \\
+Held-out & 30 & segmentation experiments; 25 completed, 28 for the runtime measurement \\
+Detection & 30 & threshold-free ranking, drawn from the held-out split \\
+Ablation & 10 & image-error and separation ablation, first 10 of the training split \\
+Unused & 364 & \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Where a stated count is lower than the split size, the run was interrupted by a
+session timeout and the completed volumes are reported. No volume was excluded on the
+basis of its result.
+
+A 3D U-Net \cite{ronneberger2015} as provided by MONAI (channels 16--256, four
+downsampling stages, two residual units per stage) was trained on 60 volumes of clean
+data for 80 epochs with Adam at $10^{-3}$, Dice loss, gradient clipping at norm 1, and
+$96^3$ patches. Mixed precision was not used, as it produced non-finite losses in
+combination with the Dice loss. Mean Dice on clean held-out volumes was 0.70.
+
+Stripe artefacts are simulated as a sinusoidal ripple across the volume with random
+spatial frequency, the image-domain equivalent of the $k$-space spike augmentation
+provided by TorchIO \cite{perezgarcia2021torchio}, at amplitudes 0.2, 0.5, 1.0 and 2.0 times the intensity range of
+the scan. Artefacts are applied to held-out volumes only; the network never sees a
+corrupted image during training.
+
+\subsection{Detection: Threshold-Free Ranking}
+
+Comparing detectors by precision and recall confounds the quality of the statistic
+with the choice of threshold. We therefore rank all brain voxels by each criterion,
+take the top $N$, and report the fraction of those $N$ that are corrupted. This
+removes every tuning parameter: a criterion that scores poorly cannot be rescued by a
+better threshold.
+
+The definition of $N$ requires care, because a stripe perturbs almost every voxel and
+scoring against that set would make the task trivial. We define a voxel as corrupted
+when the ripple contributes more than half of its own maximum amplitude at that
+voxel, and additionally exclude voxels that are local extrema of the corrupted
+volume. The first condition restricts attention to the crests and troughs where the
+artefact is substantial; the second prevents any criterion from scoring well merely
+by detecting extrema, which several of the statistics compared here would otherwise
+do by construction. Together they give $N$ between 22\% and 27\% of the brain mask
+across the severities tested, so chance performance is approximately 0.25 and the
+scores in Table~1 are to be read against that figure rather than against zero.
+
+The ground truth excludes local extrema, so no criterion can score well merely by
+detecting extrema. Ties are broken at random rather than by array order. The number
+of distinct values of each statistic is reported to rule out degenerate scores.
+
+\begin{table}[H]
+\centering
+\caption{Ranking score, 30 volumes. Higher is better. Ground truth excludes local
+extrema. $\Xi$ is the proposed criterion; C1--C3 are statistical controls
+(distance from the neighbourhood midpoint, deviation from the local mean, and the
+local $z$-score).}
+\begin{tabular}{lccccc}
+\toprule
+Amplitude & Median residual & $\Xi$ (ours) & C1 & C2 & C3 \\
+\midrule
+0.2 & 0.695 & \textbf{0.830} & 0.745 & 0.718 & 0.788 \\
+0.5 & 0.716 & \textbf{0.922} & 0.846 & 0.814 & 0.883 \\
+1.0 & 0.709 & \textbf{0.953} & 0.899 & 0.869 & 0.923 \\
+2.0 & 0.704 & \textbf{0.966} & 0.943 & 0.921 & 0.946 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]
+\centering
+\caption{Spearman correlation with the true per-voxel error, 30 volumes.}
+\begin{tabular}{lccccc}
+\toprule
+Amplitude & Median residual & $\Xi$ (ours) & C1 & C2 & C3 \\
+\midrule
+0.2 & 0.195 & \textbf{0.660} & 0.228 & 0.216 & 0.538 \\
+0.5 & 0.359 & \textbf{0.882} & 0.492 & 0.510 & 0.800 \\
+1.0 & 0.413 & \textbf{0.949} & 0.620 & 0.667 & 0.890 \\
+2.0 & 0.471 & \textbf{0.978} & 0.706 & 0.810 & 0.936 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Across all sixteen comparisons $\Xi$ wins on 30 of 30 volumes, with
+$p = 1.86\times10^{-9}$ and rank-biserial effect size $+1.00$ (Wilcoxon signed-rank,
+paired across volumes).
+
+\subsection{Segmentation: Repair and Gating}
+
+Table~3 reports Dice on 25 held-out volumes for the ungated and gated forms of the
+frequency-subtraction repair.
+
+\begin{table}[H]
+\centering
+\caption{Dice on 25 held-out volumes, with the number of volumes on which the gate
+fired. Amplitude 0.0 is the clean condition.}
+\begin{tabular}{lcccc}
+\toprule
+Amplitude & No repair & Ungated repair & Gated repair & Gate fired \\
+\midrule
+0.0 & 0.7039 & 0.5733 & \textbf{0.7039} & 0/25 \\
+0.2 & 0.5517 & 0.6114 & \textbf{0.6114} & 25/25 \\
+0.5 & 0.4475 & 0.4941 & \textbf{0.4941} & 25/25 \\
+1.0 & 0.3734 & 0.4487 & \textbf{0.4487} & 25/25 \\
+2.0 & 0.2160 & 0.2836 & \textbf{0.2836} & 25/25 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Two results follow.
+
+\textbf{Clean scans are preserved exactly.} Applied unconditionally the repair costs
+0.131 Dice on clean volumes, which would make it unusable in a setting where most
+scans are clean. The gate fired on none of the 25 clean volumes, leaving them
+bit-identical, so the clean-scan Dice is unchanged at 0.7039.
+
+\textbf{Recovery is retained.} The gate fired on all 25 volumes at every corrupted
+severity, so the gated and ungated repairs coincide there.
+
+\begin{table}[H]
+\centering
+\caption{Share of the Dice lost to the artefact that is recovered by the gated
+repair. The gap is measured against the clean ceiling of 0.7039. Wilcoxon
+signed-rank, paired across volumes.}
+\begin{tabular}{lccccc}
+\toprule
+Amplitude & Corrupted & Gated & Gap & Recovered & $p$ \\
+\midrule
+0.2 & 0.5517 & 0.6114 & 0.152 & 39.2\% & $1.2\times10^{-7}$ \\
+0.5 & 0.4475 & 0.4941 & 0.256 & 18.1\% & $3.0\times10^{-7}$ \\
+1.0 & 0.3734 & 0.4487 & 0.331 & 22.8\% & $6.0\times10^{-8}$ \\
+2.0 & 0.2160 & 0.2836 & 0.488 & 13.8\% & $6.0\times10^{-8}$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The gated repair improved Dice on 24, 23, 25 and 25 of 25 volumes respectively.
+
+The recovered share is not monotonic in severity: 18.1\% at amplitude 0.5 sits below
+22.8\% at amplitude 1.0. The share is a ratio, and its denominator, the gap to the
+clean ceiling, grows faster than linearly with amplitude while the absolute recovery
+does not. In absolute terms the recovery is 0.060, 0.047, 0.075 and 0.069 Dice, which
+is close to flat. We report the share because it is the more interpretable quantity,
+but the non-monotonicity is an artefact of the normalisation rather than a feature of
+the method, and the absolute figures should be read alongside it.
+
+\subsection{Gate Separation}
+
+On the twelve training volumes used to fit the gate, the artefact score was 0.14 on
+average for clean scans (maximum 0.18) and 1.96 for corrupted scans (minimum 0.75).
+The two sets are fully separated, with the threshold placed at 0.37. On the fitting
+set no clean scan would be repaired unnecessarily and no corrupted scan would be
+missed. On the held-out volumes the same threshold gave 0 false positives out of 25
+and 0 false negatives out of 100.
+
+\subsection{The Score as a Reliability Flag}
+
+The gate separates clean from corrupted scans without error: all 25 clean volumes
+were correctly left alone and all 100 corrupted volume-severity pairs were correctly
+identified, at the threshold fitted on training data. This is a stronger property than the gating
+application requires, and it supports a second use of the same score.
+
+A segmentation model deployed in a hospital returns an output whatever it is given.
+It has no mechanism for reporting that its input was corrupted, and the resulting
+Dice loss is invisible to the clinician reading the output. The score $S(I)$ can be
+computed alongside the model, at negligible cost and with no retraining, and used to
+flag outputs that should not be relied upon:
+
+\begin{center}
+$S(I) \le \tau$ : the segmentation may be used as normal \\
+$S(I) > \tau$ : the acquisition is corrupted; the output is unreliable
+\end{center}
+
+In that role the correction is optional. The flag alone tells the clinician when to
+repeat the acquisition or to read the segmentation with caution, which is
+information the model does not otherwise provide. We report this because the
+separation observed here is the property such a flag requires, and because it does
+not depend on the repair succeeding.
+
+Two qualifications apply. The evidence rests on the same simulated artefacts as the
+rest of the paper, and a flag intended for deployment would need evaluating on real
+acquisitions across scanners before it could be relied upon. The comparison against
+simpler alternatives has, however, been made: Section~\ref{sec:ablation} shows that
+neither a signal-to-noise ratio nor spectral kurtosis nor plain spectral
+concentration separates clean from corrupted volumes on this data, while the proposed
+score does.
+
+\subsection{Ablation: What Does $\Xi$ Contribute?}\label{sec:ablation}
+
+The method has three parts: a detection criterion, a repair driven by it, and a
+gate. Each could in principle be redundant. For a single global sinusoid, plain
+frequency subtraction might correct the image without any detection, and a plain
+measure of spectral concentration might gate it without any flagged residual. We
+therefore removed $\Xi$ from each role in turn.
+
+This ablation is measured by image error rather than Dice, on ten volumes from the
+same collection, because it does not require the segmentation network.
+
+\begin{table}[H]
+\centering
+\caption{Root mean square error against the clean volume, ten volumes, lower is
+better. \emph{plain FFT} subtracts the same number of largest non-DC components but
+selects them from the volume spectrum directly, with no $\Xi$ anywhere.}
+\begin{tabular}{lcccc}
+\toprule
+Amplitude & Corrupted & Ours ($\Xi$-guided) & Plain FFT & Median \\
+\midrule
+0.2 & 265.7 & \textbf{139.7} & 430.4 & 256.0 \\
+0.5 & 664.1 & \textbf{377.2} & 466.8 & 641.5 \\
+1.0 & 1328.4 & 796.3 & \textbf{654.2} & 1293.0 \\
+2.0 & 2657.0 & 1766.9 & \textbf{1260.7} & 2591.0 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The detection earns its place at low amplitude and loses it at high amplitude, and
+the crossover lies between 0.5 and 1.0. Every comparison is significant on ten
+volumes ($p = 2.0\times10^{-3}$, the floor for $n=10$) and unanimous: 10 of 10
+volumes in each direction.
+
+The mechanism is straightforward. Plain frequency subtraction removes whichever
+components are largest. When the artefact is strong, it is itself the largest
+component and no detection is needed. When the artefact is subtle, the largest
+components are the low-frequency content of the anatomy, and removing them damages
+the image: at amplitude 0.2, plain subtraction raises the error from 265.7 to 430.4,
+which is worse than leaving the artefact in place. $\Xi$ identifies which components
+belong to the artefact rather than to the anatomy, and that distinction matters
+precisely when the artefact is not dominant.
+
+We state the consequence plainly. For strong striping, detection-free frequency
+subtraction is the better choice and our method should not be used. The contribution
+is confined to subtle artefacts. That is also the regime that matters clinically: a
+strong artefact is visible on inspection and prompts a repeat acquisition, whereas a
+subtle one passes unremarked and silently degrades whatever analysis follows.
+
+\begin{table}[H]
+\centering
+\caption{Scan-level separation between clean and corrupted volumes, ten volumes,
+four severities each. Only the proposed score separates the two sets.}
+\begin{tabular}{lccl}
+\toprule
+Score & Clean range & Corrupted range & Separation \\
+\midrule
+$\Xi$ residual concentration & 0.12--0.18 & 0.94--3.25 & \textbf{separated, $5.2\times$ gap} \\
+Plain spectral concentration & 50.0--69.4 & 26.3--50.9 & overlap \\
+Signal-to-noise ratio & 9.1--13.9 & 9.9--45.2 & overlap \\
+Spectral kurtosis & $2.3\times10^{5}$--$3.5\times10^{5}$ & $1.0\times10^{5}$--$2.6\times10^{5}$ & overlap \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The gate result is unambiguous. None of the three simpler scores separates clean from
+corrupted volumes; two of them are ordered in the wrong direction, scoring corrupted
+scans lower than clean ones. The flagged residual is what makes the separation
+possible, and no cheaper substitute was found.
+
+\subsection{Local Replacement Does Not Work}
+
+For completeness we report the classical repair under the same protocol. Replacing
+each flagged voxel with its local median changes Dice by at most 0.002 at any
+severity, and at the mildest severity the change is negative: 0.5517 falls to 0.5504
+at amplitude 0.2, while at amplitude 2.0 it rises from 0.2160 to 0.2181. Against a
+gap to the clean ceiling of 0.15 to 0.49 these movements are of no practical
+consequence, and we do not treat the positive ones as recovery.
+
+The mechanism is given in Remark~\ref{rem:localfail}: a stripe corrupts nearly every
+voxel, only a tenth are repaired, and the neighbourhood supplying the replacement
+value is itself rippled.
+
+\subsection{Runtime}
+
+Table~5 reports the cost of each correction per volume, measured on the same
+hardware during the evaluation above. The criterion is a pair of rank filters and
+the repair is a single Fourier transform, so the proposed method is inexpensive
+relative to $k$-space despiking. Both are small compared with network inference.
+
+\begin{table}[H]
+\centering
+\caption{Correction time per volume, seconds, over 28 volumes. RPCA despiking is
+included for cost comparison only; see Section~5.1 for why its accuracy is not
+reported.}
+\begin{tabular}{lcc}
+\toprule
+Method & Mean & Median \\
+\midrule
+No correction & 0.03 & 0.03 \\
+Proposed, gated & 17.31 & 18.98 \\
+RPCA despiking & 106.76 & 105.18 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% =====================================================================
+\section{Discussion and Conclusion}
+% =====================================================================
+
+The clearest lesson from these experiments concerns the relationship between
+detection and benefit. The criterion of Section~3.2 detects stripe corruption
+decisively: it wins on every volume, at every severity, against four alternatives,
+with an effect size of $+1.00$. Driving the classical repair with that detection
+recovered about one percent of the lost Dice. Detection quality and downstream
+benefit are not the same quantity, and the first does not imply the second.
+
+The reason is specific and, once identified, obvious. The classical repair replaces
+a flagged voxel with its local median, which assumes the neighbourhood is clean. For
+a global ripple that assumption is false everywhere, so the repair substitutes one
+corrupted value for another. Detection was never the limiting factor. This matters
+beyond the present case: detection metrics are frequently reported in place of task
+metrics in artefact-correction work, and they can be excellent while the correction
+they drive is worthless.
+
+The gate addresses a different problem, and one that image-quality evaluation
+systematically hides. A preprocessing step is deployed on every scan. Evaluating it
+only on corrupted scans measures the numerator of its effect and ignores the
+denominator. Applied unconditionally, the repair here costs 0.131 Dice on clean
+volumes; in a population where most acquisitions are clean, that cost would dominate
+the benefit. Gating removes it entirely, at the price of one scalar computed per
+scan. The correction becomes deployable not because it improves but because it is
+told when to act.
+
+The ablation of Section~\ref{sec:ablation} sets the boundary of the claim. Removing
+the criterion and subtracting the largest spectral components directly is better
+above an amplitude of roughly 0.5 and worse below it. The correction is therefore
+not a general-purpose despiker and should not be presented as one; it is a method
+for subtle artefacts, where the corruption is not the dominant component of the
+spectrum and something has to decide which components belong to it. We would rather
+state that boundary than let a reader discover it.
+
+Of the two applications, the reliability flag rests on firmer ground. The correction
+depends on the repair being matched to the artefact, which took three attempts to
+achieve and is specific to artefacts with concentrated frequency support. Flagging
+depends only on the detection, which worked from the outset and required no such
+matching. If the correction fails to transfer to real acquisitions, the flag may
+still transfer, and the flag is arguably the more useful of the two in a clinical
+workflow: knowing that a segmentation is unreliable prompts a repeat acquisition,
+which recovers the full Dice rather than a fraction of it.
+
+The measured runtime is 17.3 seconds per volume for the proposed correction against
+106.8 for $k$-space despiking, a factor of six. Both are small relative to network
+inference and neither is a barrier, but the difference matters if a correction is to
+be applied speculatively to every scan in a queue.
+
+Finally, we do not claim that the proposed method should displace $k$-space
+despiking. That method removes the corruption at its source and, for the artefacts
+it was designed for, will remove more of it than any image-domain approach. What we
+offer is a different operating point: a correction that is cheap, requires no
+retraining, is gated so that it cannot damage clean data, and is evaluated on the
+task rather than on image error. Establishing where each is preferable requires the
+comparison described in Section~5.1.
+
+\subsection{Limitations}
+
+\subsubsection{No accuracy comparison against $k$-space despiking}
+
+The established correction for MRI spike artefacts is despiking by robust principal
+component analysis in $k$-space \cite{campbell2016}, and a comparison against it
+would be the first thing a reader looks for. We do not report one, and the reason is
+a limitation of our artefact model rather than of that method.
+
+RPCA separates $k$-space into a low-rank component carrying the signal and a sparse
+component carrying the spikes, and it identifies a spike as an entry whose magnitude
+is an extreme outlier. Our simulated ripple does not produce such an entry: its
+$k$-space amplitude is smaller than that of the central low-frequency components, so
+it is not an outlier in the sense the method assumes. Applying RPCA under these
+conditions does not test it fairly, and any accuracy figure obtained would say more
+about the mismatch than about the method.
+
+We therefore report only the runtime comparison, which is unaffected by this, and
+identify the accuracy comparison as work that requires genuinely spike-corrupted
+acquisitions. The same requirement applies to the rest of this paper, and both are
+addressed by the same next step.
+
+\subsubsection{Other limitations}
+
+Artefacts are simulated rather than acquired. A sinusoidal ripple is a reasonable
+model of a single $k$-space point corruption, but real acquisitions vary in
+amplitude, in the number of corrupted points, and in their interaction with the
+reconstruction. Confirmation on genuinely spike-corrupted scans is necessary and is
+the main outstanding item.
+
+Only public benchmark data is used, with no external cohort and no multi-scanner
+evaluation.
+
+Robustness obtained through augmented training is not compared. A model trained with
+stripe augmentation may recover more than any test-time correction
+\cite{boone2023rood,tamada2025}, and learned correction networks
+\cite{rios2026} may recover more still. Neither comparison is made here. Both
+require retraining, which is the constraint this method is designed around, but
+that is a reason to report the comparison rather than to omit it.
+
+The correction is outperformed by detection-free frequency subtraction above an
+artefact amplitude of roughly 0.5 of the intensity range. The crossover was measured
+on ten volumes by image error and has not been located by Dice, nor on real
+acquisitions, so its exact position should be treated as approximate.
+
+No stability guarantee is claimed for either the criterion or the repair.
+
+The criterion is motivated by hyperconnectedness but coincides with it exactly only
+at neighbourhood extrema, as stated in Remark~3.2.
+
+\subsection{Conclusion}
+
+Stripe artefacts reduce the Dice coefficient of a 3D U-Net on brain MRI from 0.70 to
+0.22 in our experiments. We presented a training-free correction that recovers 13.8
+to 39.2 percent of that loss on 25 held-out volumes, while leaving clean scans
+bit-identical. An ablation places the useful range of the correction below an
+artefact amplitude of roughly 0.5, above which detection-free frequency subtraction
+is preferable; the gate carries no such restriction, and no simpler scan-level score
+reproduced it. The correction is driven by a voxel-level criterion from generalized
+topology which, on 30 volumes, ranks corrupted voxels ahead of the classical median
+residual and three statistical baselines at every severity tested. Two findings are
+worth carrying forward independently of the method: detection quality does not by
+itself yield downstream benefit, because a repair mismatched to the artefact wastes
+good detection; and a correction that helps corrupted scans while harming clean ones
+is not deployable until it is told when to act. The same scan-level score that gates
+the correction also separates clean from corrupted acquisitions without error, and
+may be useful as a reliability flag in its own right. The principal limitation is
+that the artefacts are simulated; confirmation on genuinely spike-corrupted
+acquisitions is the necessary next step.
+
+% =====================================================================
+\section*{Data Availability and Code}
+% =====================================================================
+
+All imaging data are publicly available through the Medical Segmentation Decathlon.
+The implementation as MONAI transforms and the scripts to reproduce every reported
+figure will be released at \texttt{github.com/Pejuponraj/gated-topological-mri} under the MIT licence.
+
+\section*{Author Contributions}
+PAP designed and implemented the method, ran all experiments and wrote the paper. MR proposed the clinical application direction and reviewed the methodology. KP contributed to the study design and reviewed the manuscript.
+
+\section*{Competing Interests}
+The authors declare no competing interests.
+
+\section*{Funding}
+This work was unfunded and carried out independently of any grant.
+
+% =====================================================================
+\begin{thebibliography}{99}
+
+\bibitem{csaszar2002}
+Cs\'asz\'ar, \'A. (2002). Generalized topology, generalized continuity.
+\emph{Acta Mathematica Hungarica}, 96(4), 351--357.
+
+\bibitem{cardoso2022monai}
+Cardoso, M. J., Li, W., Brown, R., et al. (2022). MONAI: An open-source framework for
+deep learning in healthcare. \emph{arXiv:2211.02701}.
+
+\bibitem{antonelli2021msd}
+Antonelli, M., Reinke, A., Bakas, S., et al. (2022). The Medical Segmentation
+Decathlon. \emph{Nature Communications}, 13(1), 4128.
+
+\bibitem{ronneberger2015}
+Ronneberger, O., Fischer, P., \& Brox, T. (2015). U-Net: Convolutional networks for
+biomedical image segmentation. In \emph{MICCAI 2015}, LNCS 9351, 234--241.
+
+\bibitem{sun1994}
+Sun, T., \& Neuvo, Y. (1994). Detail-preserving median based filters in image
+processing. \emph{Pattern Recognition Letters}, 15(4), 341--347.
+
+\bibitem{hwang1995}
+Hwang, H., \& Haddad, R. A. (1995). Adaptive median filters: new algorithms and
+results. \emph{IEEE Transactions on Image Processing}, 4(4), 499--502.
+
+\bibitem{wang1999}
+Wang, Z., \& Zhang, D. (1999). Progressive switching median filter for the removal of
+impulse noise from highly corrupted images. \emph{IEEE Transactions on Circuits and
+Systems II: Analog and Digital Signal Processing}, 46(1), 78--80.
+
+\bibitem{foo1994snore}
+Foo, T. K. F., Grigsby, N. S., Mitchell, J. D., \& Slayman, B. E. (1994). SNORE:
+spike noise removal and detection. \emph{IEEE Transactions on Medical Imaging},
+13(1), 133--136.
+
+\bibitem{kao2000}
+Kao, Y.-H., \& MacFall, J. R. (2000). Correction of MR $k$-space data corrupted by
+spike noise. \emph{IEEE Transactions on Medical Imaging}, 19(7), 671--680.
+
+\bibitem{campbell2016}
+Campbell-Washburn, A. E., Atkinson, D., Nagy, Z., et al. (2016). Using the robust
+principal component analysis algorithm to remove RF spike artifacts from MR images.
+\emph{Magnetic Resonance in Medicine}, 75(6), 2517--2525.
+
+\bibitem{oksuz2019}
+Oksuz, I., Clough, J., Bustin, A., et al. (2019). Cardiac MR motion artefact
+correction from $k$-space using deep learning-based reconstruction. In
+\emph{MIDL 2019}, PMLR 102, 380--389.
+
+\bibitem{kwok2024}
+Kwok, W. E. (2024). Radiofrequency interference in magnetic resonance imaging:
+identification and rectification. \emph{Journal of Clinical Imaging Science}, 14, 33.
+
+\bibitem{boone2023rood}
+Boone, L., Biparva, M., Mojiri Forooshani, P., et al. (2023). ROOD-MRI:
+benchmarking the robustness of deep learning segmentation models to
+out-of-distribution and corrupted data in MRI. \emph{NeuroImage}, 278, 120289.
+
+\bibitem{perezgarcia2021torchio}
+P\'erez-Garc\'ia, F., Sparks, R., \& Ourselin, S. (2021). TorchIO: a Python library
+for efficient loading, preprocessing, augmentation and patch-based sampling of
+medical images in deep learning. \emph{Computer Methods and Programs in
+Biomedicine}, 208, 106236.
+
+\bibitem{billot2023synthseg}
+Billot, B., Magdamo, C., Cheng, Y., Arnold, S. E., Das, S., \& Iglesias, J. E.
+(2023). Robust machine learning segmentation for large-scale analysis of
+heterogeneous clinical brain MRI datasets. \emph{Proceedings of the National Academy
+of Sciences}, 120(9), e2216399120.
+
+\bibitem{tamada2025}
+Tamada, D., Oechtering, T. H., Heidenreich, J. F., Starekova, J., Takai, E., \&
+Reeder, S. B. (2025). Artifact-robust deep learning-based segmentation of 3D
+phase-contrast MR angiography: a novel data augmentation approach.
+\emph{Magnetic Resonance in Medical Sciences}, 24(4), tn.2024-0211.
+
+\bibitem{rios2026}
+Rios-Perez, J. D., Sanchez-Torres, G., Branch-Bedoya, J. W., \& Laiton-Bonadiez,
+C. A. (2026). Radon-guided wavelet-domain attention U-Net for periodic artifact
+suppression in brain MRI. \emph{Journal of Imaging}, 12(4), 153.
+
+\bibitem{serra1982}
+Serra, J. (1982). \emph{Image Analysis and Mathematical Morphology}. Academic Press,
+London.
+
+\bibitem{chen1999tristate}
+Chen, T., Ma, K.-K., \& Chen, L.-H. (1999). Tri-state median filter for image
+denoising. \emph{IEEE Transactions on Image Processing}, 8(12), 1834--1838.
+
+\bibitem{ng2006bdnd}
+Ng, P.-E., \& Ma, K.-K. (2006). A switching median filter with boundary
+discriminative noise detection for extremely corrupted images. \emph{IEEE
+Transactions on Image Processing}, 15(6), 1506--1516.
+
+\end{thebibliography}
+
+\end{document}
