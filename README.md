@@ -1,142 +1,75 @@
 # Gated Topological Correction of Stripe Artefacts in Brain MRI
 
-Code for the paper *Gated Topological Correction of Stripe Artefacts in Brain MRI*.
+Code for the paper *Gated Topological Correction of Stripe Artefacts in Brain MRI*
+(Ponraj Asirwadam Paulraj, Muthu Ramachandran, Kulvinder Panesar; under review).
 
-Radiofrequency interference and k-space spikes produce coherent stripe artefacts in
-MRI. A segmentation model trained on clean data degrades sharply on them: in our
-experiments the Dice coefficient of a 3D U-Net falls from 0.70 to 0.22.
-
-This repository contains a training-free correction. A criterion from generalized
-topology scores each voxel by how far it lies outside the span of its neighbourhood.
-The flagged voxels identify which frequency components carry the artefact, and those
-components are subtracted from the volume. A scan-level gate decides whether to
-intervene at all, so clean scans are left untouched.
+**Live demo (research prototype, not for clinical use):**
+https://huggingface.co/spaces/Pejutopo/gated-topological-mri-demo
 
 ---
 
-## What we found
+## The problem
 
-**Detection works.** Across 30 volumes and four severities, the criterion ranks
-corrupted voxels better than the classical median residual and three statistical
-controls. It wins on every volume at every severity, p ≈ 1.9e-9.
+Radiofrequency spikes in k-space produce stripe and herringbone artefacts in MRI.
+A segmentation network trained on clean data can lose much of its accuracy on such
+scans. In our experiments, a MONAI 3D U-Net for brain tumour segmentation (FLAIR)
+has a mean Dice of 0.71 on clean scans, which falls to between 0.16 and 0.57 at the
+highest amplitude of each artefact tested.
 
-**Local repair does not.** Replacing flagged voxels with the local median recovers
-about 1% of the lost Dice. A stripe corrupts nearly every voxel, only a tenth are
-repaired, and the neighbourhood supplying the replacement is itself rippled. We were
-replacing bad values with bad ones.
+## The method
 
-**Frequency subtraction does.** Same detection, different replacement. Recovers 14 to
-41% of the lost Dice.
+A training-free correction that is applied only when a scan-level score says it
+is needed.
 
-**But it damages clean scans**, 0.712 → 0.573, so it cannot be applied
-unconditionally. Most scans in a hospital are clean.
+1. **Detect.** A voxel-level outlier criterion, motivated by hereditary classes in
+   generalized topology, flags voxels that lie outside the span of their
+   neighbourhood (in implementation, a trimmed rank-filter top-hat).
+2. **Score.** The flagged voxels are Fourier transformed. A stripe makes them
+   periodic, so the spectrum is concentrated; on a clean scan it is diffuse.
+3. **Gate.** If the score exceeds a threshold fitted on training volumes only
+   (0.367), the scan is corrected; otherwise it is left untouched.
+4. **Repair.** The frequency components identified by the flagged voxels are
+   removed from the volume.
 
-**The gate fixes that.** On 25 held-out volumes it fired on 0 of 25 clean scans and
-100 of 100 corrupted ones. Clean-scan Dice is preserved exactly.
+## Main results (30 held-out volumes, Medical Segmentation Decathlon Task01)
 
-| Amplitude | No repair | Ungated | Gated | Gate fired |
-|-----------|-----------|---------|-------|------------|
-| 0.0 | 0.7039 | 0.5733 | **0.7039** | 0/25 |
-| 0.2 | 0.5517 | 0.6114 | **0.6114** | 25/25 |
-| 0.5 | 0.4475 | 0.4941 | **0.4941** | 25/25 |
-| 1.0 | 0.3734 | 0.4487 | **0.4487** | 25/25 |
-| 2.0 | 0.2160 | 0.2836 | **0.2836** | 25/25 |
+* **The gate protects clean scans.** It left all 30 clean scans untouched. Without
+  the gate, a notch filter lowered clean-scan Dice on 25 of 30.
+* **Image-domain stripes.** The gated correction raised Dice at every amplitude,
+  by 0.047 to 0.075 (27 to 30 of 30 volumes; Holm-corrected p < 1e-6).
+* **k-space spike repeated in every slice.** Dice rose by 0.097 and 0.137 at the
+  two larger amplitudes (29 and 28 of 30 volumes).
+* **No false alarms on other degradation.** The score fired on none of 180 scans
+  with Rician noise, motion-like ghosting or a bias field. A conventional spike
+  detector fired on up to 87% of them.
+* **Per-slice score.** A per-slice version of the score also detects spikes at
+  random positions in random slices (area under the ROC curve 0.999).
 
-**The ablation sets the boundary.** Removing the criterion and subtracting the
-largest spectral components directly is *better* above an amplitude of roughly 0.5
-and *worse* below it. At amplitude 0.2 the detection-free version raises the error
-from 266 to 430, worse than leaving the artefact alone. The correction is therefore
-scoped to subtle artefacts. That is also the regime that matters clinically: a strong
-artefact is visible and prompts a repeat scan, a subtle one is not.
+## Where it does not help
 
-The gate carries no such caveat. None of three simpler scan-level scores separates
-clean from corrupted volumes; the proposed score does, with a fivefold margin.
-
----
-
-## Scripts
-
-Each is self-contained and runs as a single Colab cell, or as a script on a machine
-with the data. Each begins with self-tests and refuses to run if they fail.
-
-| Script | Produces | Needs |
-|--------|----------|-------|
-| `final_stripe_experiment.py` | Detection results, 30 volumes | CPU |
-| `colab_v8_complete.py` | Training, gate fitting, Dice, 25 volumes | GPU |
-| `colab_v10_ablation.py` | Ablation by Dice | GPU |
-| `ablation_cpu.py` | Ablation by image error and gate separation, 10 volumes | CPU |
-
-The GPU scripts save the trained model and every result to Google Drive after each
-volume, so a Colab disconnect costs at most one volume and rerunning skips whatever
-is already done.
-
----
+* For spikes at random positions in random slices, the image-domain correction is
+  the wrong tool at high amplitude; robust-PCA despiking in k-space was better.
+* A notch filter that only protects low frequencies repaired about as well; the
+  contribution is the gating and the controlled comparison, not a new repair.
+* The score detects artefacts. It does **not** predict segmentation failure, and a
+  conventional spike detector was better for that task.
+* All artefacts are **simulated**. The method has **not** been validated on real
+  hospital scans; that is the next step.
 
 ## Data
 
-Medical Segmentation Decathlon, Task01_BrainTumour, derived from BraTS. Public and
-de-identified, so no ethical approval is required.
+Medical Segmentation Decathlon, Task01 BrainTumour (BraTS-derived), CC-BY-SA 4.0.
+FLAIR channel only. 60 training volumes, 30 held-out volumes; the gate threshold is
+fitted on 12 of the training volumes.
 
-```
-https://msd-for-monai.s3-us-west-2.amazonaws.com/Task01_BrainTumour.tar
-```
+## Repository status
 
-7,608,266,240 bytes. Download it inside Colab rather than uploading from a laptop.
-
----
-
-## The criterion
-
-```python
-def crit_hyper(I):
-    r1 = ndimage.rank_filter(I,  1, size=3)   # 2nd smallest in the neighbourhood
-    r2 = ndimage.rank_filter(I, -2, size=3)   # 2nd largest
-    return np.maximum(I - r2, r1 - I)         # how far outside the span
-```
-
-At neighbourhood extrema this reduces exactly to a local hyperconnectedness
-violation. Away from extrema it behaves as a rank-based deviation statistic, so it is
-*motivated by* hyperconnectedness rather than a literal test of it. We say so in the
-paper rather than overclaim.
-
-It is not a morphological gradient. On a clean step edge the gradient fires and this
-criterion is exactly zero, which is the point: it ignores anatomical boundaries and
-responds to artefacts.
-
----
-
-## Reproducing the tables
-
-```
-Table 2, 3      final_stripe_experiment.py
-Table 4, 5      colab_v8_complete.py
-Table 6, 7      ablation_cpu.py
-```
-
-All settings are fixed at the top of each script and were chosen before the runs. The
-gate threshold is fitted on training volumes only and never on the held-out set.
-
----
-
-## What this does not do
-
-Artefacts are simulated, not acquired. A sinusoidal ripple is a reasonable model of a
-single k-space point corruption, but real acquisitions vary in amplitude, in the
-number of corrupted points, and in how they interact with reconstruction.
-Confirmation on genuinely spike-corrupted scans is the main outstanding item.
-
-No accuracy comparison against RPCA despiking, the established k-space method. We
-attempted it and are not reporting it: our simulated ripple has k-space magnitude
-below the low-frequency content of the anatomy, so the sparse component of the
-decomposition does not isolate it, and the comparison would misrepresent the method.
-Runtime is reported, since it does not depend on the artefact being a fair test.
-
-Robustness through augmented training is not compared, nor are learned correction
-networks. Both require retraining, which is the constraint this method is designed
-around, but that is a reason to run the comparison rather than to skip it.
-
----
+This repository currently holds the earlier experiment scripts. The full
+experiment scripts used for the paper's final results and the demo code
+(prediction function, FastAPI service, Streamlit app) are being added.
 
 ## Licence
 
-MIT.
+Code: MIT. Data: CC-BY-SA 4.0 (Medical Segmentation Decathlon).
+
+**Research prototype. Not for clinical use.**
