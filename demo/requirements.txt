@@ -1,0 +1,11 @@
+# torch is installed separately (CPU-only build), see Dockerfile
+monai==1.6.1
+nibabel==5.4.2
+numpy==2.4.4
+scipy==1.17.1
+fastapi==0.143.0
+uvicorn==0.46.0
+python-multipart==0.0.26
+pillow==12.2.0
+streamlit==1.65.0
+requests==2.33.1

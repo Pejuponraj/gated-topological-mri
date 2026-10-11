@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Gated Topological Correction — MRI demo</title>
+<style>
+:root{--bg:#ffffff;--panel:#f3f4f7;--text:#1d2129;--muted:#5d6470;--line:#d9dce2;
+      --red:#c62828;--green:#2e7d32;--accent:#c62828}
+@media (prefers-color-scheme: dark){:root{--bg:#0e1117;--panel:#1a1d24;--text:#e8eaee;
+      --muted:#a3a9b4;--line:#2c313b}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);
+     font:15px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+.wrap{display:grid;grid-template-columns:270px 1fr;min-height:100vh}
+aside{background:var(--panel);padding:22px 18px;border-right:1px solid var(--line)}
+aside h2{font-size:1.05rem;margin:0 0 10px}
+.case{display:flex;gap:8px;align-items:flex-start;padding:6px 6px;border-radius:6px;cursor:pointer}
+.case:hover{background:rgba(127,127,127,.12)}
+.case input{margin-top:4px;accent-color:var(--accent)}
+.src{margin-top:22px;padding-top:14px;border-top:1px solid var(--line);font-size:.9rem}
+.small{font-size:.86rem;color:var(--muted)}
+main{padding:18px 28px 24px;max-width:1250px}
+.banner{background:#fff4e5;border:1px solid #f0b44c;color:#5c3d00;padding:6px 12px;
+        border-radius:8px;font-weight:600;font-size:.92rem}
+h1{font-size:1.45rem;margin:12px 0 2px}
+.grid{display:grid;grid-template-columns:1fr 2fr;gap:28px;margin-top:14px}
+.flag{border-radius:14px;padding:16px 20px;color:#fff}
+.flag h3{margin:0 0 4px;font-size:1.5rem}
+.flag p{margin:0}
+.red{background:var(--red)} .green{background:var(--green)}
+.big{font-size:1.5rem}
+.metric{margin-top:16px}
+.metric .lbl{font-size:.9rem;font-weight:600}
+.delta{display:inline-block;margin-top:2px;padding:1px 8px;border-radius:10px;font-size:.85rem;
+       background:rgba(46,125,50,.15);color:var(--green)}
+.delta.neg{background:rgba(198,40,40,.15);color:var(--red)}
+.controls{display:flex;gap:18px;align-items:center}
+.controls label{font-size:.9rem}
+input[type=range]{flex:1;accent-color:var(--accent)}
+.pics{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:10px}
+.pics img{width:100%;max-width:340px;aspect-ratio:1/1;background:#000;border-radius:6px;display:block}
+.pics h4{margin:0 0 6px;font-size:.95rem}
+details{margin-top:18px;border:1px solid var(--line);border-radius:8px;padding:8px 12px}
+summary{cursor:pointer;font-weight:600}
+footer{margin-top:18px;padding-top:10px;border-top:1px solid var(--line)}
+@media (max-width:900px){.wrap{grid-template-columns:1fr}.grid{grid-template-columns:1fr}
+  aside{border-right:0;border-bottom:1px solid var(--line)} main{padding:16px}}
+</style>
+</head>
+<body>
+<div class="wrap">
+<aside>
+  <h2>1. Choose a scan</h2>
+  <div id="cases" class="small">Loading…</div>
+  <div class="src"><b>Data source</b><br>Medical Segmentation Decathlon, Task01
+    BrainTumour (BraTS-derived), CC-BY-SA 4.0. FLAIR channel. Stripe artefacts are
+    <b>simulated</b> on these scans.
+    <p class="small">Paper: Gated Topological Correction of Stripe Artefacts in Brain
+    MRI (Paulraj, Ramachandran, Panesar; under review).</p></div>
+</aside>
+<main>
+  <div class="banner">⚠️ Research prototype — not for clinical use. Not validated on real hospital data.</div>
+  <h1>Gated Topological Correction of Stripe Artefacts in Brain MRI</h1>
+  <p><b>Dr Ponraj Asirwadam Paulraj · Prof. Muthu Ramachandran</b></p>
+  <div class="small">A 3D U-Net segments the tumour. A topological score decides whether
+    the scan has a stripe artefact; only then is the correction applied.
+    Results are pre-computed with the same code and settings as the paper.</div>
+
+  <div class="grid">
+    <section>
+      <div id="flag"></div>
+      <p class="small">The flag says whether a stripe artefact was found and corrected.
+        It does not say whether the AI segmentation is correct. Threshold fitted on 12
+        training volumes; on 30 held-out volumes the flag fired on no clean scan and on
+        every simulated stripe.</p>
+      <div class="metric"><div class="lbl">Tumour volume</div><div id="vol"></div></div>
+      <div class="metric" id="dicebox"><div class="lbl">Agreement with expert label (Dice)</div>
+        <div id="dice" class="big"></div><div id="dicedelta"></div></div>
+    </section>
+    <section>
+      <div class="controls">
+        <label for="z">2. Move through the scan (axial slice <b id="zval"></b>)</label>
+        <input type="range" id="z" min="0" max="154" value="77">
+        <label><input type="checkbox" id="seg" checked> Tumour (yellow)</label>
+      </div>
+      <div class="pics">
+        <div><h4>Before correction — input scan</h4><img id="before" alt="before correction"></div>
+        <div><h4 id="afterlbl">After correction</h4><img id="after" alt="after correction"></div>
+      </div>
+    </section>
+  </div>
+
+  <details><summary>Roadmap: from public data to hospital scans (not yet done)</summary>
+    <p>This demo uses the public BraTS-derived data, already converted, skull-stripped and
+    aligned. Hospital scans need the standard steps first:</p>
+    <p><b>DICOM → NIfTI</b> (dcm2niix) → <b>select FLAIR</b> → <b>skull stripping</b>
+    (e.g. HD-BET or SynthStrip) → <b>align to 1 mm</b> (BraTS pre-processing) →
+    <b>our gated topological correction</b> → <b>any segmentation model</b>
+    (this U-Net, or a stronger one such as nnU-Net).</p>
+    <p>The correction works on the image before the model, so it does not depend on this
+    U-Net. On hospital data the artefact threshold would be re-fitted on clean local scans
+    with the same rule. <b>None of this has been validated on hospital scans yet; that is
+    the planned next step with clinical partners.</b></p>
+  </details>
+
+  <footer class="small">Research prototype — not for clinical use. All artefacts shown are
+    simulated; the method has not been validated on real hospital data. Model: MONAI 3D
+    U-Net trained on 60 MSD volumes (FLAIR). Data: Medical Segmentation Decathlon Task01,
+    CC-BY-SA 4.0. Code: github.com/Pejuponraj/gated-topological-mri.</footer>
+</main>
+</div>
+<script>
+let cases = [], cur = null;
+const $ = id => document.getElementById(id);
+
+function img(kind, z) { return `img/${cur.id}/${z}_${kind}.webp`; }
+
+function showSlice() {
+  const z = +$("z").value, seg = $("seg").checked, fixed = cur.artefact_detected;
+  $("zval").textContent = z;
+  $("before").src = img(seg ? "ob" : "in", z);
+  $("after").src  = fixed ? img(seg ? "oa" : "co", z) : img(seg ? "ob" : "in", z);
+  for (const d of [-2, -1, 1, 2]) {                 // preload neighbours: smooth slider
+    const k = z + d; if (k < 0 || k >= cur.n_slices) continue;
+    for (const t of fixed ? ["ob","oa","in","co"] : ["ob","in"]) new Image().src = img(t, k);
+  }
+}
+
+function showCase(i) {
+  cur = cases[i];
+  const det = cur.artefact_detected;
+  $("flag").innerHTML = det
+    ? `<div class="flag red"><h3>🔴 Stripe artefact detected</h3><p>Topological correction applied before segmentation. Artefact score ${cur.score.toFixed(2)} &gt; threshold ${cur.threshold.toFixed(3)}.</p></div>`
+    : `<div class="flag green"><h3>🟢 No stripe artefact detected</h3><p>Scan used as acquired — no correction applied. Artefact score ${cur.score.toFixed(2)} ≤ threshold ${cur.threshold.toFixed(3)}.</p></div>`;
+  const vb = cur.tumour_voxels_before / 1000, va = cur.tumour_voxels_after / 1000;
+  $("vol").innerHTML = `<span class="big">${vb.toFixed(1)} → ${va.toFixed(1)} mL</span> <span class="small">${det ? "(" + (va - vb >= 0 ? "+" : "") + (va - vb).toFixed(1) + ")" : "(unchanged)"}</span>`;
+  if ("dice_after" in cur) {
+    $("dicebox").style.display = "";
+    $("dice").textContent = cur.dice_after.toFixed(2);
+    const dd = cur.dice_after - cur.dice_before;
+    $("dicedelta").innerHTML = det
+      ? `<span class="delta ${dd < 0 ? "neg" : ""}">${dd >= 0 ? "↑ +" : "↓ "}${dd.toFixed(2)} vs before (${cur.dice_before.toFixed(2)})</span>` : "";
+  } else $("dicebox").style.display = "none";
+  $("afterlbl").textContent = det ? "After correction" : "After — unchanged (no artefact found)";
+  $("z").max = cur.n_slices - 1; $("z").value = cur.best_slice;
+  showSlice();
+}
+
+fetch("data.json").then(r => r.json()).then(data => {
+  cases = data;
+  $("cases").innerHTML = cases.map((c, i) =>
+    `<label class="case"><input type="radio" name="case" value="${i}" ${i === 0 ? "checked" : ""}><span>${c.case_name}</span></label>`).join("");
+  document.querySelectorAll('input[name=case]').forEach(r => r.onchange = e => showCase(+e.target.value));
+  showCase(0);
+});
+$("z").oninput = showSlice;
+$("seg").onchange = showSlice;
+</script>
+</body>
+</html>
